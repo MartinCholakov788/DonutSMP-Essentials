@@ -800,6 +800,84 @@ class DealSetupModal(discord.ui.Modal, title="Start a deal"):
         creator_role = self.role_select.values[0]
 
         await interaction.response.defer(ephemeral=True, thinking=True)
+        # Determine seller and buyer based on creator_role
+        if creator_role == "buyer":
+            buyer_id = interaction.user.id
+            seller_id = trader.id
+        else:
+            seller_id = interaction.user.id
+            buyer_id = trader.id
+
+        guild_id = interaction.guild.id
+        ticket_number = allocate_support_ticket_number(guild_id)
+        deal_code = allocate_deal_code()
+
+        # Set up channel permission overwrites
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            trader: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            middleman: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            interaction.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True),
+        }
+
+        # Include support role permissions if configured
+        support_role = resolve_middleman_support_role(interaction.guild)
+        if support_role:
+            overwrites[support_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+        category_id = get_bot_setting(guild_id, "middleman_category_id")
+        category = interaction.guild.get_channel(int(category_id)) if category_id else None
+
+        channel = await interaction.guild.create_text_channel(
+            name=f"deal-{deal_code.lower()}",
+            category=category,
+            overwrites=overwrites,
+            topic=f"Middleman deal #{ticket_number} ({deal_code})"
+        )
+
+        # Insert the new deal/ticket record into the database
+        with db_session() as connection:
+            connection.execute(
+                """
+                INSERT INTO tickets (
+                    ticket_number, guild_id, channel_id, seller_id, buyer_id, middleman_id,
+                    deal_code, status, created_at, activity_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+                """,
+                (
+                    ticket_number, guild_id, channel.id, seller_id, buyer_id, middleman.id,
+                    deal_code, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()
+                )
+            )
+
+        ticket = get_ticket(ticket_number=ticket_number)
+        status_message = await channel.send(
+            embed=ticket_embed(ticket),
+            view=TicketControls(ticket_number),
+            allowed_mentions=discord.AllowedMentions(users=True)
+        )
+
+        with db_session() as connection:
+            connection.execute(
+                "UPDATE tickets SET status_message_id = ? WHERE ticket_number = ?",
+                (status_message.id, ticket_number)
+            )
+
+        await send_ephemeral_embed(
+            interaction,
+            "Deal created",
+            f"Your deal channel has been successfully created: {channel.mention}",
+            "success"
+        )
+        
+        await send_audit_event(
+            interaction.guild,
+            "middleman_deal_created",
+            actor=interaction.user,
+            target=channel,
+            details=f"Created deal #{ticket_number} ({deal_code}) with seller <@{seller_id}>, buyer <@{buyer_id}>, and middleman <@{middleman.id}>."
+        )
         try:
             trader = await resolve_selected_member(interaction.guild, trader.id)
             middleman = await resolve_selected_member(interaction.guild, middleman.id)
