@@ -1,0 +1,1 @@
+"""Discord application and prefix command cogs."""
