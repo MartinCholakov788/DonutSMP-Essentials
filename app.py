@@ -2727,19 +2727,27 @@ async def send_to_designated_channel(embed, channel_id=None):
     await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
-def run_web_server():
-    app.run(host="0.0.0.0", port=5000, use_reloader=False)
-
-
-if __name__ == "__main__":
+# Function to start the Discord bot in the background thread
+def run_discord_bot():
     try:
         config.validate_config()
     except RuntimeError as error:
-        raise SystemExit(str(error)) from error
-    web_server_thread = threading.Thread(
-        target=run_web_server,
-        name="flask-web-server",
+        app.logger.error("Config validation failed: %s", error)
+        return
+    bot.run(TOKEN.strip())
+
+
+# Automatically start the Discord bot thread when Gunicorn imports app.py or when run locally
+import threading
+if not any(t.name == "DiscordBotThread" for t in threading.enumerate()):
+    bot_thread = threading.Thread(
+        target=run_discord_bot,
+        name="DiscordBotThread",
         daemon=True,
     )
-    web_server_thread.start()
-    bot.run(TOKEN.strip())
+    bot_thread.start()
+
+
+if __name__ == "__main__":
+    # Local development execution
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), use_reloader=False)
