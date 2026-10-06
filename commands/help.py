@@ -41,10 +41,10 @@ class Help(commands.Cog):
         embed.add_field(
             name="🤝 Middleman tickets",
             value=(
-                "`/middleman panel` Admin-only; post the create-only ticket panel. `/middleman status`, `active`, `verify`, `release`, and `close` manage the same workflow from one organized command group.\n"
-                "Ticket setup collects the creator's IGN, agreed price (`7k`, `7m`, `7b` supported), and seller/buyer role before creating the channel. The other trader then confirms their IGN and the starting price.\n"
-                "Both participants must accept any proposed price change, and both must click **Close Deal** to lock and rename the channel.\n"
-                "The deal embed shows live status. Configured support staff use **Verify payment**, **Record release**, and **Staff close** buttons inside the deal; the staff dashboard shows the open queue.\n"
+                "`/middleman panel` is admin-only. `/middleman status`, `active`, `money-received`, `verify`, `release`, and `close` manage the workflow.\n"
+                "Ticket setup collects the agreed price (`7k`, `7m`, `7b` supported) and seller/buyer role. The other trader accepts, then the selected middleman confirms the deal.\n"
+                "The buyer pays the middleman in-game, the middleman runs `/middleman money-received`, the seller delivers, and only the buyer can confirm delivery. The middleman then pays the seller and both traders press **Finish Order**.\n"
+                "The deal embed shows live status. Configured support staff can still verify or intervene in disputed deals; the staff dashboard shows the open queue.\n"
                 "Closing archives the full HTML transcript to the configured transcript channel.\n"
                 "Inactive tickets receive participant reminders and are flagged for support review using configurable hour thresholds. Use the ticket buttons for IGN, price, payment report, delivery, and issue escalation."
             ),

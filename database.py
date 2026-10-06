@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def connect_db(path):
@@ -138,7 +138,26 @@ def _migration_6(connection):
     connection.execute("CREATE INDEX IF NOT EXISTS invite_uses_inviter_idx ON invite_uses(guild_id, inviter_id)")
 
 
-MIGRATIONS = {1: _migration_1, 2: _migration_2, 3: _migration_3, 4: _migration_4, 5: _migration_5, 6: _migration_6}
+def _migration_7(connection):
+    _add_columns(
+        connection,
+        "tickets",
+        {
+            "middleman_confirmed": "INTEGER NOT NULL DEFAULT 0",
+            "money_received": "INTEGER NOT NULL DEFAULT 0",
+        },
+    )
+
+
+MIGRATIONS = {
+    1: _migration_1,
+    2: _migration_2,
+    3: _migration_3,
+    4: _migration_4,
+    5: _migration_5,
+    6: _migration_6,
+    7: _migration_7,
+}
 
 
 def initialize_db(path):

@@ -397,6 +397,8 @@ def update_ticket(ticket_number, **values):
         "price_confirmed",
         "payment_reported",
         "payment_verified",
+        "middleman_confirmed",
+        "money_received",
         "item_delivered",
         "delivery_confirmed",
         "funds_released",
@@ -470,16 +472,20 @@ def middleman_next_action(ticket):
     if not ticket["price_confirmed"]:
         actor = ticket["buyer_id"] if ticket["price_proposed_by"] == ticket["seller_id"] else ticket["seller_id"]
         return f"<@{actor}> must confirm the agreed price", "Both traders must agree before payment can be reported."
+    if not ticket["middleman_confirmed"]:
+        return f"<@{ticket['middleman_id']}> must confirm the deal", "The agreed price is ready; the middleman must accept the deal."
+    if not ticket["money_received"]:
+        return f"<@{ticket['buyer_id']}> must send money to <@{ticket['middleman_id']}>", "The middleman accepted the deal."
     if not ticket["payment_reported"]:
         return f"<@{ticket['buyer_id']}> must report payment", "The agreed price is confirmed."
-    if not ticket["payment_verified"]:
+    if not ticket["payment_verified"] and not ticket["money_received"]:
         return "Support must verify payment in-game", "The buyer reported payment, but support has not verified it."
     if not ticket["item_delivered"]:
         return f"<@{ticket['seller_id']}> must mark the item delivered", "Payment is verified by support."
     if not ticket["delivery_confirmed"]:
         return f"<@{ticket['buyer_id']}> must confirm item receipt", "The seller marked the item delivered."
     if not ticket["funds_released"]:
-        return "Support must record the manual release", "The buyer confirmed receipt; support must transfer coins in-game first."
+        return f"<@{ticket['middleman_id']}> must pay the seller", "The buyer confirmed delivery; the middleman must transfer the agreed price in-game."
     if not ticket["close_seller_confirmed"]:
         return f"<@{ticket['seller_id']}> must confirm closure", "The manual release is recorded."
     if not ticket["close_buyer_confirmed"]:
@@ -530,6 +536,8 @@ def ticket_embed(ticket):
 
     if ticket["payment_verified"]:
         payment = "✅ Verified in-game by support"
+    elif ticket["money_received"]:
+        payment = "✅ Middleman confirmed the money is received"
     elif ticket["payment_reported"]:
         payment = "🟠 Buyer reports sent; support verification required"
     else:
@@ -551,9 +559,9 @@ def ticket_embed(ticket):
     embed.add_field(
         name="🔐 Manual release",
         value=(
-            "✅ Support recorded the in-game release"
+            "✅ Middleman recorded payment to the seller"
             if ticket["funds_released"]
-            else "Not recorded • the bot cannot move in-game currency"
+            else "Not recorded • the middleman must pay the seller in-game"
         ),
         inline=False,
     )
@@ -653,6 +661,39 @@ async def close_ticket_channel(ticket, channel=None):
     return get_ticket(ticket_number=ticket_number)
 
 
+async def send_order_summary(ticket):
+    channel = await resolve_channel(MIDDLEMAN_ORDERS_CHANNEL_ID)
+    deal_label = ticket.get("deal_code") or f"#{ticket['ticket_number']}"
+    embed = make_embed(
+        f"Order finished • {deal_label}",
+        "All required confirmations were completed and the middleman recorded payment to the seller.",
+        "success",
+    )
+    embed.add_field(name="Order ID", value=f"`{ticket['ticket_number']}`", inline=True)
+    embed.add_field(name="Agreed price", value=f"{format_coin_amount(ticket['amount'])} coins", inline=True)
+    embed.add_field(name="Seller", value=f"<@{ticket['seller_id']}>", inline=True)
+    embed.add_field(name="Buyer", value=f"<@{ticket['buyer_id']}>", inline=True)
+    embed.add_field(name="Middleman", value=f"<@{ticket['middleman_id']}>", inline=True)
+    embed.add_field(name="Minecraft IGNs", value=f"Seller: `{ticket['seller_ign']}`\nBuyer: `{ticket['buyer_ign']}`", inline=False)
+    embed.add_field(
+        name="Completed checks",
+        value="✅ Price agreed\n✅ Middleman confirmed\n✅ Money received\n✅ Delivery confirmed\n✅ Seller paid\n✅ Buyer and seller finished",
+        inline=False,
+    )
+    embed.set_footer(text=f"DonutSMP Essentials • Deal #{ticket['ticket_number']}")
+    await channel.send(
+        content=f"<@{ticket['seller_id']}> <@{ticket['buyer_id']}> <@{ticket['middleman_id']}>",
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(
+            users=[
+                discord.Object(id=ticket["seller_id"]),
+                discord.Object(id=ticket["buyer_id"]),
+                discord.Object(id=ticket["middleman_id"]),
+            ]
+        ),
+    )
+
+
 async def send_ticket_transcript(ticket, channel):
     messages = []
     async for message in channel.history(limit=None, oldest_first=True):
@@ -710,13 +751,28 @@ class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    async def on_error(self, interaction, error, item):
+        app.logger.exception(
+            "Middleman panel interaction failed for %s",
+            getattr(item, "custom_id", type(item).__name__),
+            exc_info=error,
+        )
+        message = (
+            "The bot could not open the deal form. Please try again in a moment. "
+            "If it keeps happening, contact staff."
+        )
+        try:
+            await send_ephemeral_embed(interaction, "Could not start deal", message, "error")
+        except discord.HTTPException:
+            app.logger.exception("Could not report middleman panel interaction failure")
+
     @discord.ui.button(
         label="🤝 Start a deal",
         style=discord.ButtonStyle.primary,
         custom_id="middleman:panel:create",
     )
     async def create_ticket(self, interaction, button):
-        await interaction.response.send_modal(DealSetupModal())
+        await interaction.response.send_modal(DealSetupModal(interaction.guild))
 
     @discord.ui.button(
         label="📖 How it works",
@@ -732,21 +788,38 @@ class PanelView(discord.ui.View):
         )
 
 class DealSetupModal(discord.ui.Modal, title="Start a deal"):
-    def __init__(self):
+    def __init__(self, guild):
         super().__init__()
+        self.guild = guild
+        self.amount = discord.ui.TextInput(
+            label="Agreed price in DonutSMP coins",
+            placeholder="Examples: 7000, 7k, 7m, 7b",
+            min_length=1,
+            max_length=32,
+        )
         self.trader_select = discord.ui.UserSelect(
             custom_id="middleman:setup:trader",
-            placeholder="Pick a member",
+            placeholder="Pick a trading partner",
             min_values=1,
             max_values=1,
             required=True,
         )
-        self.middleman_select = discord.ui.UserSelect(
+        middlemen = [
+            member for member_id in MIDDLEMAN_IDS
+            if (member := guild.get_member(member_id)) is not None and not member.bot
+        ]
+        self.middleman_select = discord.ui.Select(
             custom_id="middleman:setup:middleman",
             placeholder="Pick a middleman",
             min_values=1,
             max_values=1,
-            required=True,
+            options=[
+                discord.SelectOption(
+                    label=member.display_name[:100],
+                    value=str(member.id),
+                )
+                for member in middlemen[:25]
+            ],
         )
         self.role_select = discord.ui.Select(
             custom_id="middleman:setup:role",
@@ -758,34 +831,42 @@ class DealSetupModal(discord.ui.Modal, title="Start a deal"):
                 discord.SelectOption(label="I am the seller", value="seller", emoji="🛍️"),
             ],
         )
-        self.add_item(
-            discord.ui.Label(
-                text="Who are you trading with?",
-                component=self.trader_select,
-            )
-        )
-        self.add_item(
-            discord.ui.Label(
-                text="Who do you want your middleman to be?",
-                component=self.middleman_select,
-            )
-        )
-        self.add_item(
-            discord.ui.Label(
-                text="What is your role?",
-                component=self.role_select,
-            )
-        )
+        self.add_item(discord.ui.Label(text="Agreed price", component=self.amount))
+        self.add_item(discord.ui.Label(text="Trading partner", component=self.trader_select))
+        self.add_item(discord.ui.Label(text="Middleman", component=self.middleman_select))
+        self.add_item(discord.ui.Label(text="Your role", component=self.role_select))
 
     async def on_submit(self, interaction):
         if interaction.guild is None:
             await send_ephemeral_embed(interaction, "Cannot start deal", "This form must be submitted inside a Discord server, not a direct message.", "error")
             return
-
+        try:
+            amount = parse_coin_amount(str(self.amount.value))
+        except (ValueError, InvalidOperation):
+            await send_ephemeral_embed(
+                interaction,
+                "Invalid amount",
+                "Enter a positive price such as `7000`, `7k`, `7m`, or `7b`.",
+                "warning",
+            )
+            return
         trader = self.trader_select.values[0]
-        middleman = self.middleman_select.values[0]
+        middleman_id = int(self.middleman_select.values[0])
+        creator_role = self.role_select.values[0]
         if trader.id == interaction.user.id:
             await send_ephemeral_embed(interaction, "Invalid trading partner", "You cannot trade with yourself.", "warning")
+            return
+        if trader.bot:
+            await send_ephemeral_embed(interaction, "Invalid member", "Bots cannot participate as a trading partner.", "warning")
+            return
+        middleman = interaction.guild.get_member(middleman_id)
+        if middleman is None or middleman.id not in MIDDLEMAN_IDS or middleman.bot:
+            await send_ephemeral_embed(
+                interaction,
+                "Invalid middleman",
+                "Choose a configured middleman from the list.",
+                "warning",
+            )
             return
         if middleman.id == interaction.user.id:
             await send_ephemeral_embed(interaction, "Invalid middleman", "You cannot select yourself as the middleman for your own deal.", "warning")
@@ -797,91 +878,18 @@ class DealSetupModal(discord.ui.Modal, title="Start a deal"):
             await send_ephemeral_embed(interaction, "Invalid member", "Bots cannot participate as a trading partner or middleman.", "warning")
             return
 
-        creator_role = self.role_select.values[0]
-
         await interaction.response.defer(ephemeral=True, thinking=True)
-        # Determine seller and buyer based on creator_role
-        if creator_role == "buyer":
-            buyer_id = interaction.user.id
-            seller_id = trader.id
-        else:
-            seller_id = interaction.user.id
-            buyer_id = trader.id
-
-        guild_id = interaction.guild.id
-        ticket_number = allocate_support_ticket_number(guild_id)
-        deal_code = allocate_deal_code()
-
-        # Set up channel permission overwrites
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-            trader: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-            middleman: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-            interaction.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True),
-        }
-
-        # Include support role permissions if configured
-        support_role = resolve_middleman_support_role(interaction.guild)
-        if support_role:
-            overwrites[support_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
-
-        category_id = get_bot_setting(guild_id, "middleman_category_id")
-        category = interaction.guild.get_channel(int(category_id)) if category_id else None
-
-        channel = await interaction.guild.create_text_channel(
-            name=f"deal-{deal_code.lower()}",
-            category=category,
-            overwrites=overwrites,
-            topic=f"Middleman deal #{ticket_number} ({deal_code})"
-        )
-
-        # Insert the new deal/ticket record into the database
-        with db_session() as connection:
-            connection.execute(
-                """
-                INSERT INTO tickets (
-                    ticket_number, guild_id, channel_id, seller_id, buyer_id, middleman_id,
-                    deal_code, status, created_at, activity_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
-                """,
-                (
-                    ticket_number, guild_id, channel.id, seller_id, buyer_id, middleman.id,
-                    deal_code, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()
-                )
-            )
-
-        ticket = get_ticket(ticket_number=ticket_number)
-        status_message = await channel.send(
-            embed=ticket_embed(ticket),
-            view=TicketControls(ticket_number),
-            allowed_mentions=discord.AllowedMentions(users=True)
-        )
-
-        with db_session() as connection:
-            connection.execute(
-                "UPDATE tickets SET status_message_id = ? WHERE ticket_number = ?",
-                (status_message.id, ticket_number)
-            )
-
-        await send_ephemeral_embed(
-            interaction,
-            "Deal created",
-            f"Your deal channel has been successfully created: {channel.mention}",
-            "success"
-        )
-        
-        await send_audit_event(
-            interaction.guild,
-            "middleman_deal_created",
-            actor=interaction.user,
-            target=channel,
-            details=f"Created deal #{ticket_number} ({deal_code}) with seller <@{seller_id}>, buyer <@{buyer_id}>, and middleman <@{middleman.id}>."
-        )
         try:
             trader = await resolve_selected_member(interaction.guild, trader.id)
             middleman = await resolve_selected_member(interaction.guild, middleman.id)
-            ticket_number = await create_deal_ticket(interaction, trader, middleman, None, None, creator_role)
+            ticket_number = await create_deal_ticket(
+                interaction,
+                trader,
+                middleman,
+                None,
+                amount,
+                creator_role,
+            )
         except discord.Forbidden:
             await send_ephemeral_embed(
                 interaction,
@@ -945,6 +953,9 @@ class DealInviteView(discord.ui.View):
         )
         await interaction.response.edit_message(embed=make_embed(title, description, "success" if accepted else "warning"), view=None)
         if accepted:
+            if ticket["amount"]:
+                update_ticket(self.ticket_number, price_confirmed=1)
+                ticket = get_ticket(ticket_number=self.ticket_number)
             status_message = await send_deal_status_message(ticket, interaction.channel)
             with db_session() as connection:
                 connection.execute(
@@ -1073,7 +1084,7 @@ async def create_deal_ticket(interaction, other_trader, middleman, creator_ign, 
         content=f"{creator.mention} {other_trader.mention} {middleman.mention}",
         embed=make_embed(
             f"Deal {deal_code}",
-            f"{creator.mention} opened a deal with you.\n\nYou pay the bot in-game money. {creator.mention} gets it when the trade is done.\n\nSelected middleman: {middleman.mention}\n\nPress **Accept** to agree, or **Decline** if you cannot take this deal.",
+            f"{creator.mention} opened a deal with you.\n\nAfter the middleman confirms, the buyer pays the selected middleman in-game. The seller is paid after delivery is confirmed.\n\nSelected middleman: {middleman.mention}\n\nPress **Accept** to agree, or **Decline** if you cannot take this deal.",
             "info",
         ),
         view=DealInviteView(ticket_number),
@@ -1256,6 +1267,60 @@ class PriceProposalView(discord.ui.View):
         await self.resolve(interaction, False)
 
 
+class DeliveryConfirmationView(discord.ui.View):
+    def __init__(self, ticket_number):
+        super().__init__(timeout=None)
+        self.ticket_number = ticket_number
+        self.children[0].custom_id = f"middleman:{ticket_number}:public_confirm_delivery"
+
+    @discord.ui.button(
+        label="✅ Confirm delivery",
+        style=discord.ButtonStyle.success,
+        custom_id="middleman:public_confirm_delivery",
+    )
+    async def confirm(self, interaction, button):
+        ticket = get_ticket(ticket_number=self.ticket_number)
+        if not ticket or interaction.user.id != ticket["buyer_id"]:
+            await send_ephemeral_embed(interaction, "Buyer only", "Only the buyer can confirm delivery.", "error")
+            return
+        if ticket["status"] != "open" or not ticket["money_received"] or not ticket["item_delivered"]:
+            await send_ephemeral_embed(
+                interaction,
+                "Delivery confirmation unavailable",
+                "The middleman must receive the money and the seller must mark the item delivered first.",
+                "warning",
+            )
+            return
+        await confirm_delivery(interaction, ticket)
+
+
+async def confirm_delivery(interaction, ticket):
+    if ticket["delivery_confirmed"]:
+        await send_ephemeral_embed(interaction, "Already confirmed", "Delivery was already confirmed.", "info")
+        return
+    update_ticket(ticket["ticket_number"], delivery_confirmed=1)
+    seller = interaction.guild.get_member(ticket["seller_id"])
+    middleman = interaction.guild.get_member(ticket["middleman_id"])
+    mentions = [member for member in (seller, middleman) if member is not None]
+    await interaction.response.send_message(
+        content=" ".join(member.mention for member in mentions),
+        embed=make_embed(
+            f"Deal #{ticket['ticket_number']} • Delivery confirmed",
+            f"The buyer confirmed receiving the item. <@{ticket['middleman_id']}> may now pay **{format_coin_amount(ticket['amount'])} coins** to <@{ticket['seller_id']}> in-game, then press **Pay seller**.",
+            "success",
+        ),
+        allowed_mentions=discord.AllowedMentions(users=mentions),
+    )
+    await log_ticket_event(
+        interaction.channel,
+        ticket["ticket_number"],
+        "Delivery confirmed",
+        f"Buyer <@{interaction.user.id}> confirmed receipt. The middleman must now pay the seller.",
+        "success",
+    )
+    await refresh_ticket_message(ticket["ticket_number"])
+
+
 class TicketControls(discord.ui.View):
     def __init__(self, ticket_number):
         super().__init__(timeout=None)
@@ -1373,6 +1438,45 @@ class TicketControls(discord.ui.View):
         await refresh_ticket_message(self.ticket_number)
 
     @discord.ui.button(
+        label="🤝 Middleman confirms deal",
+        style=discord.ButtonStyle.success,
+        custom_id="middleman:ticket:middleman_confirm",
+        row=1,
+    )
+    async def confirm_middleman(self, interaction, button):
+        ticket = get_ticket(ticket_number=self.ticket_number)
+        if not ticket or interaction.user.id != ticket["middleman_id"]:
+            await send_ephemeral_embed(interaction, "Middleman only", "Only the selected middleman can confirm this deal.", "error")
+            return
+        if ticket["status"] != "open":
+            await send_ephemeral_embed(interaction, "Ticket closed", "This deal is no longer open.", "warning")
+            return
+        if not ticket["price_confirmed"]:
+            await send_ephemeral_embed(interaction, "Price not confirmed", "Both traders must confirm the agreed price first.", "warning")
+            return
+        if ticket["middleman_confirmed"]:
+            await send_ephemeral_embed(interaction, "Already confirmed", "You already confirmed this deal.", "info")
+            return
+        update_ticket(self.ticket_number, middleman_confirmed=1)
+        await interaction.response.send_message(
+            content=f"<@{ticket['buyer_id']}>",
+            embed=make_embed(
+                f"Deal #{self.ticket_number} • Money is due",
+                f"The middleman accepted the deal. Buyer, please send **{format_coin_amount(ticket['amount'])} coins** to <@{ticket['middleman_id']}> in-game. After receiving it, the middleman must run `/middleman money-received`.",
+                "success",
+            ),
+            allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=ticket["buyer_id"])]),
+        )
+        await log_ticket_event(
+            interaction.channel,
+            self.ticket_number,
+            "Middleman confirmed the deal",
+            f"Middleman <@{interaction.user.id}> accepted. Buyer <@{ticket['buyer_id']}> must now send the agreed price.",
+            "success",
+        )
+        await refresh_ticket_message(self.ticket_number)
+
+    @discord.ui.button(
         label="💸 Report payment (buyer)",
         style=discord.ButtonStyle.primary,
         custom_id="middleman:ticket:paid",
@@ -1381,6 +1485,14 @@ class TicketControls(discord.ui.View):
     async def report_payment(self, interaction, button):
         ticket = await self.get_participant_ticket(interaction)
         if not ticket:
+            return
+        if not ticket["middleman_confirmed"]:
+            await send_ephemeral_embed(
+                interaction,
+                "Middleman confirmation required",
+                "Wait for the middleman to confirm the deal, then have them run `/middleman money-received` after the buyer pays.",
+                "warning",
+            )
             return
         if interaction.user.id != ticket["buyer_id"]:
             await send_ephemeral_embed(interaction, "Buyer only", "Only the buyer can report payment.", "warning")
@@ -1441,11 +1553,11 @@ class TicketControls(discord.ui.View):
         if interaction.user.id != ticket["seller_id"]:
             await send_ephemeral_embed(interaction, "Seller only", "Only the seller can mark the item delivered.", "warning")
             return
-        if not ticket["payment_verified"]:
+        if not ticket["money_received"]:
             await send_ephemeral_embed(
                 interaction,
-                "Payment not verified",
-                "Support must verify payment in-game before delivery can be marked.",
+                "Money not received",
+                "The middleman must run `/middleman money-received` before the seller delivers the item.",
                 "warning",
             )
             return
@@ -1453,8 +1565,21 @@ class TicketControls(discord.ui.View):
         await send_ephemeral_embed(
             interaction,
             "Delivery marked",
-            "The buyer must confirm receiving the item before support records a manual release.",
+            "The buyer now has a **Confirm delivery** button. The seller should tpa/tpahere to the buyer and hand over the item first.",
             "success",
+        )
+        buyer = interaction.guild.get_member(ticket["buyer_id"])
+        middleman = interaction.guild.get_member(ticket["middleman_id"])
+        mentions = [member for member in (buyer, middleman) if member is not None]
+        await interaction.channel.send(
+            content=" ".join(member.mention for member in mentions),
+            embed=make_embed(
+                f"Deal #{self.ticket_number} • Item ready for confirmation",
+                f"The seller marked the item delivered. Seller, please tpa/tpahere to the buyer and give the item. Only the buyer can confirm delivery.",
+                "info",
+            ),
+            view=DeliveryConfirmationView(self.ticket_number),
+            allowed_mentions=discord.AllowedMentions(users=mentions),
         )
         await log_ticket_event(
             interaction.channel,
@@ -1478,26 +1603,47 @@ class TicketControls(discord.ui.View):
         if interaction.user.id != ticket["buyer_id"]:
             await send_ephemeral_embed(interaction, "Buyer only", "Only the buyer can confirm delivery.", "warning")
             return
-        if not ticket["item_delivered"]:
-            await send_ephemeral_embed(interaction, "Delivery not marked", "The seller has not marked the item delivered yet.", "warning")
+        if not ticket["money_received"] or not ticket["item_delivered"]:
+            await send_ephemeral_embed(interaction, "Delivery not ready", "The middleman must receive the money and the seller must mark the item delivered first.", "warning")
             return
-        update_ticket(self.ticket_number, delivery_confirmed=1)
-        await send_ephemeral_embed(
-            interaction,
-            "Delivery confirmed",
-            "Support has been notified. Any coin release is still performed manually in-game.",
-            "success",
-        )
-        await ping_support(
-            interaction.guild,
-            interaction.channel,
-            f"Buyer confirmed item receipt for deal #{self.ticket_number}. Any coin release is manual in-game.",
+        await confirm_delivery(interaction, ticket)
+
+    @discord.ui.button(
+        label="💸 Pay seller",
+        style=discord.ButtonStyle.success,
+        custom_id="middleman:ticket:pay_seller",
+        row=2,
+    )
+    async def pay_seller(self, interaction, button):
+        ticket = get_ticket(ticket_number=self.ticket_number)
+        if not ticket or interaction.user.id != ticket["middleman_id"]:
+            await send_ephemeral_embed(interaction, "Middleman only", "Only the selected middleman can record payment to the seller.", "error")
+            return
+        if ticket["status"] != "open":
+            await send_ephemeral_embed(interaction, "Ticket closed", "This deal is no longer open.", "warning")
+            return
+        if not ticket["delivery_confirmed"]:
+            await send_ephemeral_embed(interaction, "Delivery not confirmed", "The buyer must confirm delivery before you pay the seller.", "warning")
+            return
+        if ticket["funds_released"]:
+            await send_ephemeral_embed(interaction, "Already recorded", "Payment to the seller is already recorded.", "info")
+            return
+        update_ticket(self.ticket_number, funds_released=1)
+        seller = interaction.guild.get_member(ticket["seller_id"])
+        await interaction.response.send_message(
+            content=seller.mention if seller else None,
+            embed=make_embed(
+                f"Deal #{self.ticket_number} • Seller paid",
+                f"The middleman recorded paying **{format_coin_amount(ticket['amount'])} coins** to the seller. Both buyer and seller must now press **Finish Order**.",
+                "success",
+            ),
+            allowed_mentions=discord.AllowedMentions(users=[seller] if seller else []),
         )
         await log_ticket_event(
             interaction.channel,
             self.ticket_number,
-            "Delivery confirmed",
-            f"Buyer <@{interaction.user.id}> confirmed receipt of the item.",
+            "Seller paid",
+            f"Middleman <@{interaction.user.id}> recorded payment of {format_coin_amount(ticket['amount'])} coins to the seller.",
             "success",
         )
         await refresh_ticket_message(self.ticket_number)
@@ -1520,7 +1666,7 @@ class TicketControls(discord.ui.View):
             )
 
     @discord.ui.button(
-        label="🤝 Close Deal",
+        label="✅ Finish Order",
         style=discord.ButtonStyle.secondary,
         custom_id="middleman:ticket:close_deal",
         row=2,
@@ -1528,6 +1674,14 @@ class TicketControls(discord.ui.View):
     async def close_deal(self, interaction, button):
         ticket = await self.get_participant_ticket(interaction)
         if not ticket:
+            return
+        if not ticket["funds_released"]:
+            await send_ephemeral_embed(
+                interaction,
+                "Seller payment required",
+                "The middleman must press **Pay seller** before either trader can finish the order.",
+                "warning",
+            )
             return
         field = "close_seller_confirmed" if interaction.user.id == ticket["seller_id"] else "close_buyer_confirmed"
         if ticket[field]:
@@ -1540,11 +1694,12 @@ class TicketControls(discord.ui.View):
             interaction.channel,
             self.ticket_number,
             "Close vote recorded",
-            f"<@{interaction.user.id}> agreed to close the deal. Seller and buyer must both agree.",
+            f"<@{interaction.user.id}> pressed **Finish Order**. Both buyer and seller must confirm the order.",
             "warning",
         )
         if ticket["close_seller_confirmed"] and ticket["close_buyer_confirmed"]:
             await interaction.response.defer(ephemeral=True, thinking=True)
+            await send_order_summary(ticket)
             await close_ticket_channel(ticket, interaction.channel)
             await send_ephemeral_embed(
                 interaction,
@@ -1556,7 +1711,7 @@ class TicketControls(discord.ui.View):
             await send_ephemeral_embed(
                 interaction,
                 "Close vote recorded",
-                "Your agreement is recorded. The other trader must also choose **Close Deal** to close and lock this channel.",
+                "Your confirmation is recorded. The other trader must also press **Finish Order** to publish the order summary and close this channel.",
                 "warning",
             )
         await refresh_ticket_message(self.ticket_number)
@@ -1885,6 +2040,25 @@ async def resolve_channel(channel_id):
     return channel if channel else await bot.fetch_channel(channel_id)
 
 
+def mark_missing_ticket_channel(ticket_number, *, support=False):
+    now = datetime.now(timezone.utc).isoformat()
+    with db_session() as connection:
+        if support:
+            connection.execute(
+                """UPDATE support_tickets
+                   SET status = 'deleted', deleted_at = ?, last_activity_at = ?
+                   WHERE ticket_number = ? AND status = 'open'""",
+                (now, now, ticket_number),
+            )
+        else:
+            connection.execute(
+                """UPDATE tickets
+                   SET status = 'closed', activity_at = ?, last_activity_at = ?
+                   WHERE ticket_number = ? AND status = 'open'""",
+                (now, now, ticket_number),
+            )
+
+
 def ticket_reminder_recipient(ticket):
     if ticket["pending_amount"]:
         target_id = ticket["buyer_id"] if ticket["price_proposed_by"] == ticket["seller_id"] else ticket["seller_id"]
@@ -1896,16 +2070,16 @@ def ticket_reminder_recipient(ticket):
     if not ticket["price_confirmed"]:
         target_id = ticket["buyer_id"] if ticket["price_proposed_by"] == ticket["seller_id"] else ticket["seller_id"]
         return "participant", target_id, "Please confirm the agreed price."
-    if not ticket["payment_reported"]:
-        return "participant", ticket["buyer_id"], "Please report whether the agreed payment was sent."
-    if not ticket["payment_verified"]:
-        return "support", None, "Payment is awaiting manual in-game verification."
+    if not ticket["middleman_confirmed"]:
+        return "participant", ticket["middleman_id"], "Please confirm the deal before payment begins."
+    if not ticket["money_received"]:
+        return "participant", ticket["buyer_id"], "Please send the agreed price to the middleman; they must run `/middleman money-received`."
     if not ticket["item_delivered"]:
         return "participant", ticket["seller_id"], "Please update the item-delivery status."
     if not ticket["delivery_confirmed"]:
         return "participant", ticket["buyer_id"], "Please confirm whether you received the item."
     if not ticket["funds_released"]:
-        return "support", None, "Delivery is confirmed; support must handle any manual coin transfer."
+        return "participant", ticket["middleman_id"], "Delivery is confirmed; pay the seller and press **Pay seller**."
     if ticket["close_seller_confirmed"] and not ticket["close_buyer_confirmed"]:
         return "participant", ticket["buyer_id"], "The seller requested to close this deal."
     if ticket["close_buyer_confirmed"] and not ticket["close_seller_confirmed"]:
@@ -1928,7 +2102,16 @@ async def process_stalled_tickets():
             if activity_at.tzinfo is None:
                 activity_at = activity_at.replace(tzinfo=timezone.utc)
             inactive_hours = (now - activity_at).total_seconds() / 3600
-            channel = await resolve_channel(ticket["channel_id"])
+            try:
+                channel = await resolve_channel(ticket["channel_id"])
+            except discord.NotFound:
+                mark_missing_ticket_channel(ticket["ticket_number"])
+                app.logger.warning(
+                    "Marked deal #%s closed because channel %s no longer exists",
+                    ticket["ticket_number"],
+                    ticket["channel_id"],
+                )
+                continue
             recipient_type, recipient_id, reminder = ticket_reminder_recipient(ticket)
             if inactive_hours >= TICKET_REMINDER_HOURS and recipient_type:
                 last_reminded_at = ticket["last_reminded_at"]
@@ -2001,7 +2184,16 @@ async def process_stalled_support_tickets():
             if last_activity_at.tzinfo is None:
                 last_activity_at = last_activity_at.replace(tzinfo=timezone.utc)
             inactive_hours = (now - last_activity_at).total_seconds() / 3600
-            channel = await resolve_channel(ticket["channel_id"])
+            try:
+                channel = await resolve_channel(ticket["channel_id"])
+            except discord.NotFound:
+                mark_missing_ticket_channel(ticket["ticket_number"], support=True)
+                app.logger.warning(
+                    "Marked support ticket #%s deleted because channel %s no longer exists",
+                    ticket["ticket_number"],
+                    ticket["channel_id"],
+                )
+                continue
             reminder_hours = int(get_bot_setting(ticket["guild_id"], "ticket_reminder_hours", str(TICKET_REMINDER_HOURS)))
             auto_close_hours = int(get_bot_setting(ticket["guild_id"], "ticket_auto_close_hours", str(TICKET_AUTO_CLOSE_HOURS)))
             if inactive_hours >= reminder_hours and not ticket["last_reminded_at"]:
@@ -2194,6 +2386,15 @@ class MiddlemanBot(commands.Bot):
             ]
         for ticket_number in ticket_numbers:
             self.add_view(TicketControls(ticket_number))
+        with db_session() as connection:
+            delivered_ticket_numbers = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT ticket_number FROM tickets WHERE status = 'open' AND money_received = 1 AND item_delivered = 1 AND delivery_confirmed = 0"
+                )
+            ]
+        for ticket_number in delivered_ticket_numbers:
+            self.add_view(DeliveryConfirmationView(ticket_number))
         for ticket_number in pending_invites:
             self.add_view(DealInviteView(ticket_number))
         with db_session() as connection:
@@ -2535,5 +2736,10 @@ if __name__ == "__main__":
         config.validate_config()
     except RuntimeError as error:
         raise SystemExit(str(error)) from error
-    threading.Thread(target=run_web_server, daemon=True).start()
-    bot.run(TOKEN)
+    web_server_thread = threading.Thread(
+        target=run_web_server,
+        name="flask-web-server",
+        daemon=True,
+    )
+    web_server_thread.start()
+    bot.run(TOKEN.strip())

@@ -25,6 +25,10 @@ TRANSACTION_WEBHOOK_SECRET=use_a_long_random_secret
 MIDDLEMEN_PANEL_CHANNEL_ID=1554210069988507829
 MIDDLEMEN_CATEGORY_ID=1455842233528877151
 MIDDLEMEN_SUPPORT_ROLE_ID=1455842100456329380
+# Comma-separated Discord user IDs allowed to be selected as middlemen.
+MIDDLEMAN_IDS=123456789012345678,234567890123456789
+# Channel where completed middleman order summaries are published.
+MIDDLEMAN_ORDERS_CHANNEL_ID=1556000162114183218
 VOUCH_CHANNEL_ID=1554218114567241971
 MARKET_SELLING_CHANNEL_ID=1554204131659354163
 MARKET_BUYING_CHANNEL_ID=1554204024868179998
@@ -80,7 +84,7 @@ The Flask server listens on port `5000`; the Discord bot runs alongside it. With
 
 ## Middleman tickets
 
-An administrator runs `/middleman panel` to post the marketplace panel in channel `1554210069988507829`. After a member presses **Start a deal**, they select one of the configured middlemen and choose **I am the buyer** or **I am the seller**. The bot creates a sequential `middleman-deal-N` channel and assigns a unique `ABC-123` deal code. The selected middleman is mentioned in the opening invitation and can accept or decline it. The ticket remains in the configured middleman category and keeps the existing ticket controls.
+An administrator runs `/middleman panel` to post the marketplace panel in channel `1554210069988507829`. After a member presses **Start a deal**, one popup collects the agreed price, lets them choose any non-bot trading partner, choose a configured middleman from `MIDDLEMAN_IDS`, and choose whether they are the buyer or seller. The bot creates a sequential `middleman-deal-N` channel and assigns a unique `ABC-123` deal code. The selected middleman is mentioned in the opening invitation and can accept or decline it. The ticket remains in the configured middleman category and keeps the existing ticket controls.
 
 The buyer can report sending coins, but that is only a claim. Both participants must agree to any price change; the proposed amount stays pending until the other member accepts it. A support member must inspect DonutSMP in-game and use the **Verify payment** button in the deal before the seller can mark the item delivered. The buyer then confirms receipt. A support member must manually transfer the coins in-game and only afterward use **Record release** to record that release. Either participant can request **Close Deal**, but the channel locks and becomes `closed-deal-N` only after both agree. Support can use the staff-only **Staff close** button for review, while the staff dashboard shows the oldest open deals needing attention. Closing either way archives the full HTML transcript, including the public ticket timeline and attachment links, to channel `1455842412483182708`. Inactive tickets get participant reminders after `TICKET_REMINDER_HOURS` and a one-time support review flag after `TICKET_REVIEW_HOURS`. This bot cannot access balances, custody coins, or make any DonutSMP transfer. The **Problem** controls offer guidance and staff escalation. Ticket state and sequential numbering persist in SQLite across restarts.
 

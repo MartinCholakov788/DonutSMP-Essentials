@@ -14,10 +14,12 @@ class Middleman(commands.GroupCog, group_name="middleman", group_description="Ma
         channel = await core.resolve_channel(core.PANEL_CHANNEL_ID)
         embed = core.make_embed(
             "Middleman",
-            "1. Press **Start a deal** and fill in one form.\n"
-            "2. One of you puts the money into the bot. The other does their side of the trade.\n"
-            "3. Once they get it, whoever paid presses **Release** and the bot pays the other.\n"
-            "**0% fee.** Staff handle disputes.",
+            "1. Press **Start a deal** and fill in the price, trading partner, middleman, and your role in one form.\n"
+            "2. The other trader accepts, then the selected middleman confirms the deal.\n"
+            "3. The buyer pays the middleman in-game; the middleman runs `/middleman money-received`.\n"
+            "4. The seller delivers the item, the buyer confirms delivery, and the middleman pays the seller.\n"
+            "5. Buyer and seller both press **Finish Order** to publish the completed order.\n"
+            "**0% fee.** Staff can still help with disputes.",
             "success",
         )
         if core.MIDDLEMAN_BANNER_URL:
@@ -75,6 +77,46 @@ class Middleman(commands.GroupCog, group_name="middleman", group_description="Ma
         await core.log_ticket_event(interaction.channel, ticket["ticket_number"], "Payment manually verified", f"Support member <@{interaction.user.id}> recorded an in-game payment check.", "success")
         await core.send_audit_event(interaction.guild, "middleman_payment_verified", interaction.user, interaction.channel, f"Verified payment for deal #{ticket['ticket_number']}.")
         await core.send_ephemeral_embed(interaction, "Payment verification recorded", "This records the staff member's in-game check. The bot does not inspect DonutSMP or move coins.", "success")
+        await core.refresh_ticket_message(ticket["ticket_number"])
+
+    @app_commands.command(name="money-received", description="Confirm that the buyer paid you the agreed price in-game.")
+    @app_commands.guild_only()
+    async def money_received(self, interaction: discord.Interaction):
+        ticket = core.get_ticket(channel_id=interaction.channel_id)
+        if not ticket or interaction.user.id != ticket["middleman_id"]:
+            await core.send_ephemeral_embed(interaction, "Middleman only", "Only the selected middleman can confirm receiving the money.", "error")
+            return
+        if ticket["status"] != "open":
+            await core.send_ephemeral_embed(interaction, "Ticket closed", "This deal is no longer open.", "warning")
+            return
+        if not ticket["middleman_confirmed"]:
+            await core.send_ephemeral_embed(interaction, "Deal not confirmed", "Press **Middleman confirms deal** before accepting payment.", "warning")
+            return
+        if ticket["money_received"]:
+            await core.send_ephemeral_embed(interaction, "Already recorded", "Money receipt is already recorded.", "info")
+            return
+        core.update_ticket(
+            ticket["ticket_number"],
+            money_received=1,
+            payment_reported=1,
+            payment_verified=1,
+        )
+        await interaction.response.send_message(
+            content=f"<@{ticket['buyer_id']}>",
+            embed=core.make_embed(
+                f"Deal #{ticket['ticket_number']} • Money received",
+                f"The middleman confirmed receiving **{core.format_coin_amount(ticket['amount'])} coins**. Seller, please tpa/tpahere to the buyer and deliver the item. The buyer will then confirm delivery.",
+                "success",
+            ),
+            allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=ticket["buyer_id"])]),
+        )
+        await core.log_ticket_event(
+            interaction.channel,
+            ticket["ticket_number"],
+            "Money received",
+            f"Middleman <@{interaction.user.id}> confirmed receiving the agreed price from the buyer.",
+            "success",
+        )
         await core.refresh_ticket_message(ticket["ticket_number"])
 
     @app_commands.command(name="release", description="Record a manual in-game coin release after delivery confirmation.")

@@ -104,6 +104,46 @@ class WorkflowTests(unittest.TestCase):
             value = connection.execute("SELECT last_activity_at FROM support_tickets WHERE ticket_number = 900").fetchone()[0]
         self.assertEqual(value, timestamp)
 
+    def test_middleman_setup_modal_uses_modal_supported_components(self):
+        guild = type("Guild", (), {"get_member": lambda self, member_id: None})()
+        modal = main.DealSetupModal(guild)
+        components = modal.to_dict()["components"]
+        self.assertEqual(len(components), 4)
+        self.assertTrue(all(component["type"] == 18 for component in components))
+        self.assertEqual([component["component"]["type"] for component in components], [4, 5, 3, 3])
+
+    def test_missing_ticket_channel_is_marked_closed(self):
+        main.initialize_db()
+        with main.db_session() as connection:
+            connection.execute(
+                """INSERT INTO tickets
+                   (ticket_number, guild_id, channel_id, creator_id, buyer_id, activity_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (901, 1, 99901, 902, 903, "2026-10-01T10:00:00+00:00", "2026-10-01T10:00:00+00:00"),
+            )
+        main.mark_missing_ticket_channel(901)
+        with main.db_session() as connection:
+            status = connection.execute(
+                "SELECT status FROM tickets WHERE ticket_number = ?", (901,)
+            ).fetchone()[0]
+        self.assertEqual(status, "closed")
+
+    def test_missing_support_ticket_channel_is_marked_deleted(self):
+        main.initialize_db()
+        with main.db_session() as connection:
+            connection.execute(
+                """INSERT INTO support_tickets
+                   (ticket_number, guild_id, channel_id, creator_id, ticket_type, reason, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (902, 1, 99902, 903, "general", "test", "2026-10-01T10:00:00+00:00"),
+            )
+        main.mark_missing_ticket_channel(902, support=True)
+        with main.db_session() as connection:
+            status = connection.execute(
+                "SELECT status FROM support_tickets WHERE ticket_number = ?", (902,)
+            ).fetchone()[0]
+        self.assertEqual(status, "deleted")
+
     def test_webhook_retries_are_idempotent(self):
         main.initialize_db()
         client = main.app.test_client()
