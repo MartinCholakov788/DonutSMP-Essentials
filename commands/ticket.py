@@ -97,9 +97,11 @@ def ticket_channel_name(ticket_type: str, member: discord.Member, number: int) -
 
 
 async def generate_transcript(channel: discord.TextChannel) -> discord.File:
-    """Generates a comprehensive text transcript of a channel's history."""
+    """Generate a detailed, portable transcript of a channel's complete history."""
     lines = [
-        f"Transcript for Support Channel: {channel.name}",
+        f"Transcript for: #{channel.name}",
+        f"Channel ID: {channel.id}",
+        f"Guild: {channel.guild.name} ({channel.guild.id})",
         f"Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
         "=" * 60
     ]
@@ -107,20 +109,59 @@ async def generate_transcript(channel: discord.TextChannel) -> discord.File:
     try:
         async for msg in channel.history(limit=None, oldest_first=True):
             time_str = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            author = msg.author.display_name
+            author = f"{msg.author} ({msg.author.id})"
             content = msg.clean_content or "[No text content]"
             
-            lines.append(f"\n[{time_str}] {author}: {content}")
+            lines.append(f"\n[{time_str}] {author} | Message ID: {msg.id}")
+            lines.append(content)
             
             if msg.attachments:
-                lines.append(f"    📎 Attachments: {', '.join(a.url for a in msg.attachments)}")
+                lines.append("    Attachments:")
+                for attachment in msg.attachments:
+                    lines.append(f"      - {attachment.filename} ({attachment.size} bytes): {attachment.url}")
             if msg.embeds:
-                lines.append(f"    📄 [Embed Included]")
+                lines.append(f"    Embeds: {len(msg.embeds)}")
+                for embed in msg.embeds:
+                    if embed.title:
+                        lines.append(f"      Title: {embed.title}")
+                    if embed.description:
+                        lines.append(f"      Description: {embed.description}")
+                    for field in embed.fields:
+                        lines.append(f"      Field: {field.name} = {field.value}")
+            if msg.reactions:
+                lines.append("    Reactions: " + ", ".join(
+                    f"{reaction.emoji} ({reaction.count})" for reaction in msg.reactions
+                ))
     except discord.Forbidden:
         lines.append("\n[Error: Bot lacked permission to read full message history]")
         
     file_bytes = io.BytesIO("\n".join(lines).encode('utf-8'))
     return discord.File(file_bytes, filename=f"transcript-{channel.name}.txt")
+
+
+async def archive_support_transcript(ticket: Dict[str, Any], channel: discord.TextChannel) -> None:
+    """Send a support-ticket transcript and summary to the configured archive channel."""
+    if ticket.get("transcript_sent_at"):
+        return
+    transcript = await generate_transcript(channel)
+    archive_channel = await core.resolve_channel(core.TRANSCRIPT_CHANNEL_ID)
+    await archive_channel.send(
+        content=(
+            f"📚 **Support ticket archive — #{ticket['ticket_number']}**\n"
+            f"Type: `{TICKET_LABELS.get(ticket['ticket_type'], ticket['ticket_type'])}`\n"
+            f"Created by: <@{ticket['creator_id']}> (`{ticket['creator_id']}`)\n"
+            f"Claimed by: <@{ticket['claimed_by']}> (`{ticket['claimed_by']}`)\n"
+            f"Status: `{ticket['status']}` • Channel: `#{channel.name}` (`{channel.id}`)\n"
+            f"Reason: {ticket['reason'][:1000]}"
+        ),
+        file=transcript,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    with core.db_session() as connection:
+        connection.execute(
+            "UPDATE support_tickets SET transcript_sent_at = ? WHERE ticket_number = ?",
+            (datetime.now(timezone.utc).isoformat(), ticket["ticket_number"]),
+        )
 
 
 def ticket_embeds(ticket: Dict[str, Any]) -> List[discord.Embed]:
@@ -301,8 +342,19 @@ async def close_support_ticket(interaction: discord.Interaction, ticket_number: 
             pass
             
     await interaction.channel.edit(name=f"closed-{interaction.channel.name}"[:95], reason=f"Ticket #{ticket_number} closed")
-    
+
     updated_ticket = get_support_ticket(ticket_number=ticket_number)
+    try:
+        await archive_support_transcript(updated_ticket, interaction.channel)
+    except Exception:
+        core.app.logger.exception("Could not archive support ticket #%s", ticket_number)
+        await core.send_audit_event(
+            interaction.guild,
+            "support_ticket_archive_failed",
+            actor=actor,
+            target=interaction.channel,
+            details=f"Ticket #{ticket_number} is closed, but its detailed archive could not be sent.",
+        )
     await core.send_audit_event(
         interaction.guild, "support_ticket_closed", actor, interaction.channel, f"Closed support ticket #{ticket_number}."
     )
@@ -547,14 +599,14 @@ class SupportDeleteCountdownView(discord.ui.View):
             )
             
         try:
-            audit_channel = await core.resolve_channel(core.AUDIT_LOG_CHANNEL_ID)
-            if audit_channel:
-                await audit_channel.send(
-                    content=f"🗑️ Transcript for deleted ticket **#{self.ticket_number}** (Initiated by <@{self.actor_id}>)",
-                    file=transcript_file
-                )
+            archive_channel = await core.resolve_channel(core.TRANSCRIPT_CHANNEL_ID)
+            await archive_channel.send(
+                content=f"🗑️ **Deleted support ticket archive — #{self.ticket_number}**\nInitiated by <@{self.actor_id}>",
+                file=transcript_file,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         except Exception:
-            pass 
+            core.app.logger.exception("Could not archive deleted support ticket #%s", self.ticket_number)
             
         await self.channel.delete(reason=f"Ticket #{self.ticket_number} deleted")
 
@@ -692,9 +744,20 @@ class Ticket(commands.GroupCog, group_name="ticket", group_description="Create a
         ticket = get_support_ticket(channel_id=interaction.channel_id, guild_id=interaction.guild_id)
         if ticket:
             core.touch_support_ticket(ticket["ticket_number"])
-        await interaction.response.defer(ephemeral=False)
-        transcript = await generate_transcript(interaction.channel)
-        await interaction.followup.send(content="📄 **Transcript Generated**", file=transcript)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await archive_support_transcript(ticket, interaction.channel)
+        except Exception:
+            core.app.logger.exception("Could not manually archive support ticket #%s", ticket["ticket_number"])
+            await interaction.followup.send(
+                "The archive could not be delivered. Check the configured transcript channel and bot permissions.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"📚 Ticket **#{ticket['ticket_number']}** was archived in <#{core.TRANSCRIPT_CHANNEL_ID}>.",
+            ephemeral=True,
+        )
 
     @app_commands.command(name="transfer", description="Transfer a claimed ticket to another staff member.")
     async def transfer(self, interaction: discord.Interaction, staff_member: discord.Member):

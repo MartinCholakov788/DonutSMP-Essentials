@@ -27,17 +27,25 @@ async def restrict_member(member):
     if verification_channel is None:
         raise RuntimeError("The configured verification channel does not exist.")
     for channel in member.guild.channels:
-        if channel.id == VERIFICATION_CHANNEL_ID:
-            await channel.set_permissions(
-                member,
-                view_channel=True,
-                send_messages=False,
-                read_message_history=True,
-                reason="New member must complete verification",
+        try:
+            if channel.id == VERIFICATION_CHANNEL_ID:
+                await channel.set_permissions(
+                    member,
+                    view_channel=True,
+                    send_messages=False,
+                    read_message_history=True,
+                    reason="New member must complete verification",
+                )
+            else:
+                # Remove stale member-specific denies created by older onboarding code.
+                await channel.set_permissions(member, overwrite=None, reason="Reset stale onboarding permissions")
+        except (discord.Forbidden, discord.HTTPException):
+            core.app.logger.warning(
+                "Could not update onboarding permissions for member %s in channel %s",
+                member.id,
+                channel.id,
+                exc_info=True,
             )
-        else:
-            # Remove stale member-specific denies created by older onboarding code.
-            await channel.set_permissions(member, overwrite=None, reason="Reset stale onboarding permissions")
 
 
 async def restore_member_access(member):

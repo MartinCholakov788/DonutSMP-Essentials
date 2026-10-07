@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def connect_db(path):
@@ -149,6 +149,10 @@ def _migration_7(connection):
     )
 
 
+def _migration_8(connection):
+    _add_columns(connection, "support_tickets", {"transcript_sent_at": "TEXT"})
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
@@ -157,6 +161,7 @@ MIGRATIONS = {
     5: _migration_5,
     6: _migration_6,
     7: _migration_7,
+    8: _migration_8,
 }
 
 

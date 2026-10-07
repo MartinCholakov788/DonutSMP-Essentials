@@ -29,6 +29,7 @@ last_database_backup_at = None
 error_counts = {}
 error_alerts = {}
 invite_cache = {}
+boot_announcement_sent = False
 
 app = Flask(__name__)
 intents = discord.Intents.default()
@@ -251,6 +252,7 @@ async def send_audit_event(guild, action, actor=None, target=None, details=""):
         "target_id": target_id,
         "target_type": type(target).__name__ if target is not None else None,
         "target_name": getattr(target, "name", getattr(target, "display_name", None)),
+        "channel_id": getattr(target, "id", None) if isinstance(target, discord.abc.GuildChannel) else None,
     }
     try:
         record_audit_event(
@@ -275,8 +277,13 @@ async def send_audit_event(guild, action, actor=None, target=None, details=""):
             embed.add_field(name="Actor", value=f"<@{actor_id}>", inline=True)
         if target_id:
             embed.add_field(name="Target", value=str(target_id), inline=True)
+        if metadata["target_name"]:
+            embed.add_field(name="Target name", value=str(metadata["target_name"])[:1024], inline=True)
+        if metadata["channel_id"]:
+            embed.add_field(name="Channel", value=f"<#{metadata['channel_id']}> (`{metadata['channel_id']}`)", inline=True)
         embed.add_field(name="Category", value=action.split("_", 1)[0].title(), inline=True)
         embed.add_field(name="Severity", value=severity.title(), inline=True)
+        embed.add_field(name="Guild", value=f"{getattr(guild, 'name', 'Unknown')} (`{guild_id}`)", inline=False)
         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
     except Exception:
         app.logger.exception("Could not publish audit event %s", action)
@@ -699,7 +706,11 @@ async def send_ticket_transcript(ticket, channel):
     async for message in channel.history(limit=None, oldest_first=True):
         author = html.escape(getattr(message.author, "display_name", str(message.author)))
         timestamp = message.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        parts = [f"<header><strong>{author}</strong> <time>{timestamp}</time></header>"]
+        parts = [
+            f'<header><strong>{author}</strong> <time>{timestamp}</time> '
+            f'<small>Message ID: {message.id} '
+            f'<a href="{html.escape(message.jump_url, quote=True)}">Jump to message</a></small></header>'
+        ]
         if message.clean_content:
             content = html.escape(message.clean_content).replace("\n", "<br>")
             parts.append(f"<p>{content}</p>")
@@ -713,6 +724,10 @@ async def send_ticket_transcript(ticket, channel):
                 parts.append(
                     f"<p><strong>{html.escape(field.name)}</strong><br>{html.escape(field.value).replace(chr(10), '<br>')}</p>"
                 )
+            if embed.url:
+                parts.append(f'<p>Embed URL: <a href="{html.escape(embed.url, quote=True)}">{html.escape(embed.url)}</a></p>')
+            if embed.footer and embed.footer.text:
+                parts.append(f"<p><strong>Embed footer:</strong> {html.escape(embed.footer.text)}</p>")
         for attachment in message.attachments:
             url = html.escape(attachment.url, quote=True)
             filename = html.escape(attachment.filename)
@@ -724,9 +739,18 @@ async def send_ticket_transcript(ticket, channel):
 <title>Middleman ticket transcript</title><style>
 body{font:15px system-ui,sans-serif;max-width:900px;margin:32px auto;padding:0 20px;color:#20252b;background:#f4f6f8}
 h1{font-size:24px}article{background:white;border:1px solid #d9dee5;border-radius:6px;margin:12px 0;padding:14px;overflow-wrap:anywhere}
-header{color:#506070}time{margin-left:8px;font-size:12px}p{white-space:normal}
+header{color:#506070}time{margin-left:8px;font-size:12px}small{margin-left:8px}p{white-space:normal}
 </style></head><body>
-""" + f"<h1>Middleman deal #{ticket['ticket_number']} transcript</h1>" + "".join(messages) + "</body></html>"
+""" + (
+        f"<h1>Middleman deal #{ticket['ticket_number']} transcript</h1>"
+        f"<p><strong>Channel:</strong> #{html.escape(channel.name)} ({channel.id})"
+        f"<br><strong>Created:</strong> {html.escape(str(ticket.get('created_at', 'unknown')))}"
+        f"<br><strong>Seller:</strong> {ticket.get('seller_id')} "
+        f"<strong>Buyer:</strong> {ticket.get('buyer_id')} "
+        f"<strong>Middleman:</strong> {ticket.get('middleman_id')}</p>"
+        + "".join(messages)
+        + "</body></html>"
+    )
     transcript_channel = await resolve_channel(TRANSCRIPT_CHANNEL_ID)
     filename = f"middleman-deal-{ticket['ticket_number']}.html"
     await transcript_channel.send(
@@ -2473,10 +2497,33 @@ async def handle_app_command_error(interaction, error):
 
 @bot.event
 async def on_ready():
+    global boot_announcement_sent
     await bot.change_presence(
         status=discord.Status.dnd,
         activity=discord.Activity(type=discord.ActivityType.watching, name=BOT_ACTIVITY),
     )
+    if not boot_announcement_sent:
+        try:
+            channel = await resolve_channel(AUDIT_LOG_CHANNEL_ID)
+            embed = make_embed(
+                "Bot is now active",
+                (
+                    f"**{BOT_NAME}** is online and ready to serve the server.\n\n"
+                    "All configured services, ticket workflows, moderation logging, "
+                    "and support systems are available."
+                ),
+                "success",
+            )
+            embed.add_field(name="Status", value="🟢 Operational", inline=True)
+            embed.add_field(name="Presence", value=f"DND • Watching {BOT_ACTIVITY}", inline=True)
+            embed.add_field(name="Guilds", value=f"{len(bot.guilds):,}", inline=True)
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            boot_announcement_sent = True
+        except Exception:
+            app.logger.exception(
+                "Could not send boot announcement to audit channel %s",
+                AUDIT_LOG_CHANNEL_ID,
+            )
     if not ticket_reminder_worker.is_running():
         ticket_reminder_worker.start()
     if not webhook_outbox_worker.is_running():
@@ -2506,10 +2553,13 @@ async def on_message(message):
 async def on_member_join(member):
     if member.bot:
         return
+    inviter_id = None
+    inviter_count = 0
+    invite_status = "unknown"
+    onboarding_status = "not attempted"
+    welcome_status = "not attempted"
     try:
         await record_invite_use(member)
-        inviter_id = None
-        inviter_count = 0
         with db_session() as connection:
             row = connection.execute(
                 "SELECT inviter_id FROM invite_uses WHERE guild_id = ? AND joined_user_id = ? ORDER BY joined_at DESC LIMIT 1",
@@ -2521,10 +2571,20 @@ async def on_member_join(member):
                     "SELECT COUNT(*) FROM invite_uses WHERE guild_id = ? AND inviter_id = ?",
                     (member.guild.id, inviter_id),
                 ).fetchone()[0]
+                invite_status = "identified" if inviter_id is not None else "no matching invite"
+    except Exception:
+        app.logger.exception("Could not record invite use for new member %s", member.id)
+        invite_status = "lookup failed"
 
+    try:
         from commands.verify import restrict_member
-
         await restrict_member(member)
+        onboarding_status = "verification access configured"
+    except Exception:
+        app.logger.exception("Could not configure onboarding for new member %s", member.id)
+        onboarding_status = "configuration failed"
+
+    try:
         channel = await resolve_channel(WELCOME_CHANNEL_ID)
         inviter_text = "Unknown" if inviter_id is None else f"<@{inviter_id}>"
         embed = make_embed(
@@ -2557,8 +2617,51 @@ async def on_member_join(member):
             embed=embed,
             allowed_mentions=discord.AllowedMentions(users=[member] + ([member.guild.get_member(inviter_id)] if inviter_id and member.guild.get_member(inviter_id) else [])),
         )
-    except discord.HTTPException:
+        welcome_status = "sent"
+    except Exception:
         app.logger.exception("Could not send welcome message for member %s", member.id)
+        welcome_status = "delivery failed"
+
+    await send_audit_event(
+        member.guild,
+        "member_joined",
+        target=member,
+        details=(
+            f"New member {member} (`{member.id}`) joined. "
+            f"Invite: {invite_status}; onboarding: {onboarding_status}; welcome: {welcome_status}; "
+            f"inviter: {inviter_id or 'unknown'}; inviter total: {inviter_count}."
+        ),
+    )
+
+
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot:
+        return
+    await send_audit_event(
+        message.guild,
+        "message_deleted",
+        actor=message.author,
+        target=message.channel,
+        details=f"Message `{message.id}` by {message.author} was deleted. Content: {message.clean_content[:1500] or '[no text]'}",
+    )
+
+
+@bot.event
+async def on_message_edit(before, after):
+    if before.author.bot or before.content == after.content:
+        return
+    await send_audit_event(
+        after.guild,
+        "message_edited",
+        actor=after.author,
+        target=after.channel,
+        details=(
+            f"Message `{after.id}` edited by {after.author}. "
+            f"Before: {before.clean_content[:700] or '[no text]'} | "
+            f"After: {after.clean_content[:700] or '[no text]'}"
+        ),
+    )
 
 
 @bot.event
